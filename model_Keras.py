@@ -16,9 +16,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import keras as k
-from tensorflow.keras import layers, Dropout
-from qkeras import *
-from keras.layers import Input, Dense
+from keras import layers, initializers
+from keras.layers import Input, Dense, Dropout
 import tensorflow as tf
 
 class LayerNorm(layers.Layer):
@@ -215,40 +214,78 @@ class GPT(layers.Layer):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
-        n_params = sum(p.numel() for p in self.parameters())
+        # n_params = sum(p.numel() for p in self.parameters())
+        # if non_embedding:
+        #     n_params -= self.transformer.wpe.weight.numel()
+        # return n_params
+        n_params = sum(tf.size(w).numpy() for w in self.trainable_weights)
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            # Assuming self.transformer is the name of your transformer model
+            n_params -= tf.size(self.transformer['wpe'].trainable_weights[0]).numpy()
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # if isinstance(module, nn.Linear):
+        #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        #     if module.bias is not None:
+        #         torch.nn.init.zeros_(module.bias)
+        # elif isinstance(module, nn.Embedding):
+        #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, layers.Dense):
+            # Initialize weights with a normal distribution
+            module.kernel_initializer = initializers.RandomNormal(mean=0.0, stddev=0.02)
+            # Initialize biases with zeros
+            if module.use_bias:
+                module.bias_initializer = initializers.Zeros()
+        elif isinstance(module, tf.keras.layers.Embedding):
+            # Initialize weights with a normal distribution
+            module.embeddings_initializer = initializers.RandomNormal(mean=0.0, stddev=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    # def forward(self, idx, targets=None):
+    #     device = idx.device
+    #     b, t = idx.size()
+    #     assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+    #     pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+    #     # forward the GPT model itself
+    #     tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+    #     pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+    #     x = self.transformer.drop(tok_emb + pos_emb)
+    #     for block in self.transformer.h:
+    #         x = block(x)
+    #     x = self.transformer.ln_f(x)
+
+    #     if targets is not None:
+    #         # if we are given some desired targets also calculate the loss
+    #         logits = self.lm_head(x)
+    #         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    #     else:
+    #         # inference-time mini-optimization: only forward the lm_head on the very last position
+    #         logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+    #         loss = None
+
+    #     return logits, loss
+
+    def call(self, idx, targets=None):
+        b, t = idx.shape.as_list()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = tf.range(t, dtype=tf.int32)
 
-        # forward the GPT model itself
+        # Forward pass
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer['ln_f'](x)
 
+        # Calculate loss if targets are provided
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = tf.keras.losses.sparse_categorical_crossentropy(targets, logits, from_logits=True)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, -1, :])
             loss = None
 
         return logits, loss
@@ -259,7 +296,8 @@ class GPT(layers.Layer):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.set_weights([self.transformer.wpe.get_weights()[0][:block_size]])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -291,59 +329,61 @@ class GPT(layers.Layer):
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
+        # Load model weights from the Keras model
+        sd = model.get_weights()
+        sd_keys = model.weights
+        sd_keys = [k for k in sd_keys if not k.name.endswith('.attn.bias')]  # Discard this mask / buffer, not a parameter
+
+        # Initialize a Hugging Face/Transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+        sd_hf = model_hf.get_weights()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
+        # Copy while ensuring all parameters are aligned and match in names and shapes
+        sd_keys_hf = model_hf.weights
+        sd_keys_hf = [k for k in sd_keys_hf if not k.name.endswith('.attn.masked_bias')]  # Ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.name.endswith('.attn.bias')]  # Same, just the mask (buffer)
+        transposed = ['attn/c_attn/kernel', 'attn/c_proj/kernel', 'mlp/c_fc/kernel', 'mlp/c_proj/kernel']
+        # Basically, the OpenAI checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # This means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
+            if any(k.name.endswith(w) for w in transposed):
+                # Special treatment for the Conv1D weights we need to transpose
+                assert k.shape[::-1] == sd[k.name].shape
+                model.get_layer(k.name.split('/')[0]).set_weights([np.transpose(sd_hf[k.name])])
             else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+                # Vanilla copy over the other parameters
+                assert k.shape == sd[k.name].shape
+                model.get_layer(k.name.split('/')[0]).set_weights([sd_hf[k.name]])
 
         return model
 
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        # param_dict = {pn: p for pn, p in self.named_parameters()}
+        # # filter out those that do not require grad
+        # param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        # nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # optim_groups = [
+        #     {'params': decay_params, 'weight_decay': weight_decay},
+        #     {'params': nodecay_params, 'weight_decay': 0.0}
+        # ]
+        # num_decay_params = sum(p.numel() for p in decay_params)
+        # num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        # print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # # Create AdamW optimizer and use the fused version if it is available
+        # fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # use_fused = fused_available and device_type == 'cuda'
+        # extra_args = dict(fused=True) if use_fused else dict()
+        # optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        # print(f"using fused AdamW: {use_fused}")
+        optimizer = AdamW(learning_rate=learning_rate, beta_1=betas[0], beta_2=betas[1], weight_decay=weight_decay)
 
         return optimizer
 
@@ -379,13 +419,13 @@ class GPT(layers.Layer):
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                v, top_k_indices = tf.math.top_k(logits, k=top_k)# min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
+            probs = tf.nn.softmax(logits, axis=-1)
+            idx_next = tf.random.categorical(tf.math.log(probs), num_samples=1, dtype=tf.int32)
+            # Transpose to match the shape of idx in PyTorch (assuming idx has shape (B, T))
+            idx_next = tf.transpose(idx_next)
+            # Append sampled index to the running sequence
+            idx = tf.concat([idx, idx_next], axis=1)
         return idx
